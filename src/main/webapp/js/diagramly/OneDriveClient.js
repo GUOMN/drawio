@@ -1,6 +1,6 @@
 /**
- * Copyright (c) 2006-2017, JGraph Ltd
- * Copyright (c) 2006-2017, Gaudenz Alder
+ * Copyright (c) 2006-2020, JGraph Ltd
+ * Copyright (c) 2006-2020, draw.io AG
  */
 OneDriveClient = function(editorUi)
 {
@@ -11,7 +11,7 @@ OneDriveClient = function(editorUi)
 	if (authInfo != null)
 	{
 		this.token = authInfo.access_token;
-		this.endpointHint = authInfo.endpointHint;
+		this.endpointHint = authInfo.endpointHint != null ? authInfo.endpointHint.replace('/Documents', '/_layouts/15/onedrive.aspx') : authInfo.endpointHint;
 		this.tokenExpiresOn = authInfo.expiresOn;
 		
 		var remainingTime = (this.tokenExpiresOn - Date.now()) / 1000;
@@ -30,6 +30,8 @@ mxUtils.extend(OneDriveClient, DrawioClient);
 OneDriveClient.prototype.clientId = window.DRAWIO_MSGRAPH_CLIENT_ID || ((window.location.hostname == 'test.draw.io') ?
 	'2e598409-107f-4b59-89ca-d7723c8e00a4' : '45c10911-200f-4e27-a666-9e9fca147395');
 
+OneDriveClient.prototype.clientId = window.location.hostname == 'app.diagrams.net' ?
+		'b5ff67d6-3155-4fca-965a-59a3655c4476' : OneDriveClient.prototype.clientId;
 /**
  * OAuth 2.0 scopes for installing Drive Apps.
  */
@@ -150,7 +152,15 @@ OneDriveClient.prototype.updateUser = function(success, error, failOnAuth)
 				success();
 			}
 		}
-	}), error);
+	}), mxUtils.bind(this, function(err)
+	{
+		window.clearTimeout(timeoutThread);
+			    	
+		if (acceptResponse)
+		{
+			error(err);
+		}
+	}));
 };
 
 OneDriveClient.prototype.resetTokenRefresh = function(expires_in)
@@ -180,6 +190,23 @@ OneDriveClient.prototype.resetTokenRefresh = function(expires_in)
  */
 OneDriveClient.prototype.authenticate = function(success, error, failOnAuth)
 {
+	var req = new mxXmlRequest(this.redirectUri + '?getState=1', null, 'GET');
+	
+	req.send(mxUtils.bind(this, function(req)
+	{
+		if (req.getStatus() >= 200 && req.getStatus() <= 299)
+		{
+			this.authenticateStep2(req.getText(), success, error, failOnAuth);
+		}
+		else if (error != null)
+		{
+			error(req);
+		}
+	}), error);
+};
+
+OneDriveClient.prototype.authenticateStep2 = function(state, success, error, failOnAuth)
+{
 	if (window.onOneDriveCallback == null)
 	{
 		var auth = mxUtils.bind(this, function()
@@ -191,7 +218,8 @@ OneDriveClient.prototype.authenticate = function(success, error, failOnAuth)
 			
 			if (authInfo != null)
 			{
-				var req = new mxXmlRequest(this.redirectUri + '?refresh_token=' + authInfo.refresh_token, null, 'GET');
+				var req = new mxXmlRequest(this.redirectUri + '?refresh_token=' + authInfo.refresh_token +
+						'&state=' + encodeURIComponent('cId=' + this.clientId + '&domain=' + window.location.hostname + '&ver=2&token=' + state), null, 'GET'); //To identify which app/domain is used
 				
 				req.send(mxUtils.bind(this, function(req)
 				{
@@ -233,7 +261,8 @@ OneDriveClient.prototype.authenticate = function(success, error, failOnAuth)
 					var url = 'https://login.microsoftonline.com/common/oauth2/v2.0/authorize' +
 						'?client_id=' + this.clientId + '&response_type=code' +
 						'&redirect_uri=' + encodeURIComponent(this.redirectUri) +
-						'&scope=' + encodeURIComponent(this.scopes);
+						'&scope=' + encodeURIComponent(this.scopes) +
+						'&state=' + encodeURIComponent('cId=' + this.clientId + '&domain=' + window.location.hostname + '&ver=2&token=' + state); //To identify which app/domain is used
 	
 					var width = 525,
 						height = 525,
@@ -345,7 +374,8 @@ OneDriveClient.prototype.getAccountTypeAndEndpoint = function(success, error)
 				
 				if (resp.webUrl.indexOf('.sharepoint.com') > 0) 
 			 	{
-					this.endpointHint = resp.webUrl;
+					//TODO Confirm this works with all sharepoint sites
+					this.endpointHint = resp.webUrl.replace('/Documents', '/_layouts/15/onedrive.aspx');
 				}
 				else
 				{
@@ -417,7 +447,15 @@ OneDriveClient.prototype.executeRequest = function(url, success, error)
 					error(this.parseRequestText(req));
 				}
 			}
-		}), error);
+		}), mxUtils.bind(this, function(err)
+		{
+			window.clearTimeout(timeoutThread);
+				    	
+			if (acceptResponse)
+			{
+				error(err);
+			}
+		}));
 	});
 	
 	if (this.token == null || this.tokenExpiresOn - Date.now() < 60000) //60 sec tolerance window
@@ -502,7 +540,7 @@ OneDriveClient.prototype.getFile = function(id, success, error, denyConvert, asL
 			
 			// Handles .vsdx, Gliffy and PNG+XML files by creating a temporary file
 			if (/\.v(dx|sdx?)$/i.test(meta.name) || /\.gliffy$/i.test(meta.name) ||
-				(!this.ui.useCanvasForExport && binary))
+				/\.pdf$/i.test(meta.name) || (!this.ui.useCanvasForExport && binary))
 			{
 				var mimeType = (meta.file != null) ? meta.file.mimeType : null;
 				this.ui.convertFile(meta['@microsoft.graph.downloadUrl'], meta.name, mimeType,
@@ -518,7 +556,7 @@ OneDriveClient.prototype.getFile = function(id, success, error, denyConvert, asL
 					error({code: App.ERROR_TIMEOUT})
 				}), this.ui.timeout);
 				
-				this.ui.loadUrl(meta['@microsoft.graph.downloadUrl'], mxUtils.bind(this, function(data)
+				this.ui.editor.loadUrl(meta['@microsoft.graph.downloadUrl'], mxUtils.bind(this, function(data)
 				{
 					try
 					{
@@ -618,7 +656,8 @@ OneDriveClient.prototype.getFile = function(id, success, error, denyConvert, asL
 			    		error(this.parseRequestText(req));
 			    	}
 				}), binary || (meta.file != null && meta.file.mimeType != null &&
-					meta.file.mimeType.substring(0, 6) == 'image/'));
+					(meta.file.mimeType.substring(0, 6) == 'image/' ||
+					meta.file.mimeType == 'application/pdf')));
 			}
 		}
 		else
@@ -808,69 +847,22 @@ OneDriveClient.prototype.saveFile = function(file, success, error, etag)
 		var fn = mxUtils.bind(this, function(data)
 		{
 			var url = this.getItemURL(file.getId());
-	
+			
 			this.writeFile(url + '/content/', data, 'PUT', null, mxUtils.bind(this, function(resp)
 			{
-				// Checks for truncated files in OneDrive by comparing expected and actual file size
-				// Apparently in some cases the file is not truncated but the expected and actual
-				// file size do still defer and cases with truncated files have not been detected
-				// ie. there were no cases where the file size was significantly off.
-	//			try
-	//			{
-	//				if (typeof window.Blob !== 'undefined')
-	//				{
-	//
-	//					// Returns string length in bytes instead of chars to check returned file size
-	//					function byteCount(str)
-	//					{
-	//						try
-	//						{
-	//							return new Blob([str]).size
-	//						}
-	//						catch (e)
-	//						{
-	//							// ignore
-	//						}
-	//						
-	//						return null;
-	//					};
-	//					
-	//					var exp = (typeof data === 'string') ? byteCount(data) : data.size;
-	//					
-	//					if (resp != null && exp != null && resp.size != exp)
-	//					{
-	//						// Logs failed save
-	//						var user = this.getUser();
-	//						
-	//						EditorUi.sendReport('Critical: Truncated OneDrive File ' +
-	//							new Date().toISOString() + ':' + '\n\nBrowser=' + navigator.userAgent +
-	//							'\nFile=' + file.getId() + '\nMime=' + file.meta.file.mimeType +
-	//							'\nUser=' + ((user != null) ? user.id : 'unknown') +
-	//							 	'-client_' + ((file.sync != null) ? file.sync.clientId : 'nosync') +
-	//							'\nExpected=' + exp + ' Actual=' + resp.size)
-	//						EditorUi.logError('Critical: Truncated OneDrive File ' + file.getId(),
-	//							null, 'expected_' + exp + '-actual_' + resp.size +
-	//							'-mime_' + file.meta.file.mimeType,
-	//							'user-' + ((user != null) ? user.id : 'unknown') +
-	//						 	((file.sync != null) ? '-client_' + file.sync.clientId : '-nosync'));
-	//					}
-	//				}
-	//			}
-	//			catch (e)
-	//			{
-	//				// ignore
-	//			}
-				
 				success(resp, savedData);
 			}), error, etag);
 		});
 		
 		if (this.ui.useCanvasForExport && /(\.png)$/i.test(file.meta.name))
 		{
+			var p = this.ui.getPngFileProperties(this.ui.fileNode);
+			
 			this.ui.getEmbeddedPng(mxUtils.bind(this, function(data)
 			{
 				fn(this.ui.base64ToBlob(data, 'image/png'));
-			}), error, (this.ui.getCurrentFile() != file) ? savedData : null);
+			}), error, (this.ui.getCurrentFile() != file) ?
+				savedData : null, p.scale, p.border);
 		}
 		else
 		{
@@ -909,13 +901,21 @@ OneDriveClient.prototype.writeFile = function(url, data, method, contentType, su
 				try
 				{
 					var acceptResponse = true;
+					var timeoutThread = null;
 					
-					var timeoutThread = window.setTimeout(mxUtils.bind(this, function()
+					try
 					{
-						acceptResponse = false;
-						error({code: App.ERROR_TIMEOUT, retry: doExecute});
-					}), this.ui.timeout);
-		
+						timeoutThread = window.setTimeout(mxUtils.bind(this, function()
+						{
+							acceptResponse = false;
+							error({code: App.ERROR_TIMEOUT});
+						}), this.ui.timeout);
+					}
+					catch (e)
+					{
+						// Ignore window closed
+					}
+					
 					var req = new mxXmlRequest(url, data, method);
 					
 					req.setRequestHeaders = mxUtils.bind(this, function(request, params)
@@ -1192,7 +1192,8 @@ OneDriveClient.prototype.logout = function()
 			localStorage.removeItem('odpickerv7cache');	
 		}
 	}
-	
+
+	window.open('https://login.microsoftonline.com/common/oauth2/v2.0/logout', 'logout', 'width=525,height=525,status=no,resizable=yes,toolbar=no,menubar=no,scrollbars=yes');
 	this.clearPersistentToken();
 	this.setUser(null);
 	this.token = null;

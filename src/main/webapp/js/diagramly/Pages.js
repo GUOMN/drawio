@@ -330,10 +330,13 @@ EditorUi.prototype.initPages = function()
 		{
 			this.selectNextPage(true);
 		}));
-		
-		this.keyHandler.bindAction(33, true, 'previousPage', true); // Ctrl+Shift+PageUp
-		this.keyHandler.bindAction(34, true, 'nextPage', true); // Ctrl+Shift+PageDown
-		
+
+		if (this.isPagesEnabled())
+		{
+			this.keyHandler.bindAction(33, true, 'previousPage', true); // Ctrl+Shift+PageUp
+			this.keyHandler.bindAction(34, true, 'nextPage', true); // Ctrl+Shift+PageDown
+		}
+			
 		// Updates the tabs after loading the diagram
 		var graph = this.editor.graph;
 		var graphViewValidateBackground = graph.view.validateBackground; 
@@ -628,7 +631,7 @@ Graph.prototype.getViewState = function()
 /**
  * Overrides setDefaultParent
  */
-Graph.prototype.setViewState = function(state)
+Graph.prototype.setViewState = function(state, removeOldExtFonts)
 {
 	if (state != null)
 	{
@@ -656,7 +659,9 @@ Graph.prototype.setViewState = function(state)
 		var oldExtFonts = this.extFonts;
 		this.extFonts = state.extFonts || [];
 
-		if (oldExtFonts != null)
+		// Removing old fonts is important for real-time synchronization
+		// But, for page change, it results in undesirable font flicker
+		if (removeOldExtFonts && oldExtFonts != null)
 		{
 			for (var i = 0; i < oldExtFonts.length; i++)
 			{
@@ -736,6 +741,7 @@ Graph.prototype.setViewState = function(state)
 //TODO How to make this function secure with no injection??
 Graph.prototype.addExtFont = function(fontName, fontUrl, dontRemember)
 {
+	// KNOWN: Font not added when pasting cells with custom fonts
 	if (fontName && fontUrl)
 	{
 		var fontId = 'extFont_' + fontName;
@@ -748,6 +754,9 @@ Graph.prototype.addExtFont = function(fontName, fontUrl, dontRemember)
 			}
 			else
 			{
+				var head = document.getElementsByTagName('head')[0];
+				
+				// KNOWN: Should load fonts synchronously
 				var style = document.createElement('style');
 				
 				style.appendChild(document.createTextNode('@font-face {\n' +
@@ -755,7 +764,7 @@ Graph.prototype.addExtFont = function(fontName, fontUrl, dontRemember)
 			            '\tsrc: url("'+ fontUrl +'");\n' + 
 			            '}'));
 				
-				style.setAttribute('id', fontId);				
+				style.setAttribute('id', fontId);
 				var head = document.getElementsByTagName('head')[0];
 		   		head.appendChild(style);
 			}
@@ -790,11 +799,11 @@ Graph.prototype.addExtFont = function(fontName, fontUrl, dontRemember)
 /**
  * Executes selection of a new page.
  */
-EditorUi.prototype.updatePageRoot = function(page)
+EditorUi.prototype.updatePageRoot = function(page, checked)
 {
 	if (page.root == null)
 	{
-		var node = this.editor.extractGraphModel(page.node);
+		var node = this.editor.extractGraphModel(page.node, null, checked);
 		var cause = Editor.extractParserError(node);
 		
 		if (cause)
@@ -1580,7 +1589,7 @@ EditorUi.prototype.addTabListeners = function(page, tab)
  * Returns an absolute URL to the given page or null of absolute links
  * to pages are not supported in this file.
  */
-EditorUi.prototype.getLinkForPage = function(page)
+EditorUi.prototype.getLinkForPage = function(page, params)
 {
 	if (!mxClient.IS_CHROMEAPP && !EditorUi.isElectronApp)
 	{
@@ -1588,8 +1597,14 @@ EditorUi.prototype.getLinkForPage = function(page)
 		
 		if (file != null && file.constructor != LocalFile && this.getServiceName() == 'draw.io')
 		{
-			var search = this.getSearch(['create', 'title', 'mode', 'url', 'drive', 'splash', 'state']);
+			var search = this.getSearch(['create', 'title', 'mode', 'url', 'drive', 'splash',
+				'state', 'clibs', 'ui', 'viewbox', 'hide-pages']);
 			search += ((search.length == 0) ? '?' : '&') + 'page-id=' + page.getId();
+			
+			if (params != null)
+			{
+				search += '&' + params.join('&');
+			}
 			
 			return window.location.protocol + '//' + window.location.host + '/' + search + '#' + file.getHash();
 		}
@@ -1624,17 +1639,43 @@ EditorUi.prototype.createPageMenu = function(page, label)
 		}), parent);
 		
 		var url = this.getLinkForPage(page);
-		
+
 		if (url != null)
 		{
 			menu.addSeparator(parent);
 			
 			menu.addItem(mxResources.get('link'), null, mxUtils.bind(this, function()
 			{
-				var dlg = new EmbedDialog(this, url);
-				this.showDialog(dlg.container, 440, 240, true, true);
-				dlg.init();
-			}), parent);
+				this.showPublishLinkDialog(mxResources.get('url'), true, null, null,
+					mxUtils.bind(this, function(linkTarget, linkColor, allPages, lightbox, editLink, layers)
+				{
+					var params = this.createUrlParameters(linkTarget, linkColor, allPages, lightbox, editLink, layers);
+					
+					if (!allPages)
+					{
+						params.push('hide-pages=1');
+					}
+					
+					if (!graph.isSelectionEmpty())
+					{
+						var bounds = graph.getBoundingBox(graph.getSelectionCells());
+								
+						var t = graph.view.translate;
+						var s = graph.view.scale;
+						bounds.width /= s;
+						bounds.height /= s;
+						bounds.x = bounds.x / s - t.x;
+						bounds.y = bounds.y / s - t.y;
+					
+						params.push('viewbox=' + encodeURIComponent(JSON.stringify({x: Math.round(bounds.x), y: Math.round(bounds.y),
+							width: Math.round(bounds.width), height: Math.round(bounds.height), border: 100})));
+					}
+					
+					var dlg = new EmbedDialog(this, this.getLinkForPage(page, params));
+					this.showDialog(dlg.container, 440, 240, true, true);
+					dlg.init();
+				}));
+			}));
 		}
 		
 		menu.addSeparator(parent);
@@ -1643,6 +1684,16 @@ EditorUi.prototype.createPageMenu = function(page, label)
 		{
 			this.duplicatePage(page, mxResources.get('copyOf', [page.getName()]));
 		}), parent);
+		
+		if (!mxClient.IS_CHROMEAPP && !EditorUi.isElectronApp && this.getServiceName() == 'draw.io')
+		{		
+			menu.addSeparator(parent);
+			
+			menu.addItem(mxResources.get('openInNewWindow'), null, mxUtils.bind(this, function()
+			{
+				this.editor.editAsNew(this.getFileData(true, null, null, null, true, true));
+			}), parent);
+		}
 	});
 };
 

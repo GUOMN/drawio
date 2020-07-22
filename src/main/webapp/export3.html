@@ -8,24 +8,19 @@
 	</script>
 	<!-- CSS for print output is needed for using current window -->
 	<style type="text/css">
-		@media print {
-		  table.mxPageSelector { display: none; }
-		  hr.mxPageBreak { display: none; }
-		}
-		@media screen {
-		  table.mxPageSelector { position: fixed; right: 10px; top: 10px;font-family: Arial; font-size:10pt; border: solid 1px darkgray;background: white; border-collapse:collapse; }
-		  table.mxPageSelector td { border: solid 1px gray; padding:4px; }
-		  body.mxPage { background: gray; }
-		}
+	  	span.MathJax_SVG svg { shape-rendering: crispEdges; }
+	  	table.mxPageSelector { display: none; }
+	  	hr.mxPageBreak { display: none; }
 	</style>
 	<link rel="stylesheet" href="mxgraph/css/common.css" charset="UTF-8" type="text/css">
     <script src="js/app.min.js"></script>
 	<script>
-		var mxIsElectron = navigator.userAgent.toLowerCase().indexOf(' electron/') > -1;
+		var mxIsElectron = navigator.userAgent != null &&
+			navigator.userAgent.toLowerCase().indexOf(' electron/') > -1;
 		var GOOGLE_APPS_MAX_AREA = 25000000;
 		var GOOGLE_SHEET_MAX_AREA = 1048576; //1024x1024
 		
-		Editor.initMath();
+		Editor.initMath('math/MathJax.js');
 	
 		function render(data)
 		{
@@ -37,7 +32,14 @@
 				data.scale = 1;
 			}
 			
-			var graph = new Graph(document.getElementById('graph'));
+			document.body.innerHTML = '';
+			var container = document.createElement('div');
+			container.id = 'graph';
+			container.style.width = '100%';
+			container.style.height = '100%';
+			document.body.appendChild(container);
+			
+			var graph = new Graph(container);
 			data.border = parseInt(data.border) || 0;
 			data.w = parseFloat(data.w) || 0;
 			data.h = parseFloat(data.h) || 0;
@@ -76,6 +78,12 @@
 				data.xml = Editor.extractGraphModelFromPng('data:image/png;base64,' + data.xml);
 			}
 			
+			//IE11 sends incorrect xml
+			if (data.xml.substring(0, 11) == '<#document>')
+			{
+				data.xml = data.xml.substring(11, data.xml.length - 12);
+			}
+			
 			// Parses XML
 			var doc = mxUtils.parseXml(data.xml);
 			var node = Editor.extractGraphModel(doc.documentElement, true);
@@ -100,7 +108,31 @@
 			var xmlDoc = node.ownerDocument;
 			var diagrams = null;
 			var from = 0;
-			
+
+			if (mxIsElectron && data.format == 'xml')
+			{
+				const { ipcRenderer } = require('electron');
+
+				try
+				{
+					var xml = mxUtils.getXml(xmlDoc);
+					EditorUi.prototype.createUi = function(){};
+					EditorUi.prototype.addTrees = function(){};
+					EditorUi.prototype.updateActionStates = function(){};
+				 	var editorUi = new EditorUi();
+					var tmpFile = new LocalFile(editorUi, xml);
+					editorUi.setCurrentFile(tmpFile);
+					editorUi.setFileData(xml);
+					ipcRenderer.send('xml-data', mxUtils.getXml(editorUi.getXmlFileData(null, null, data.uncompressed)));
+				}
+				catch(e)
+				{
+					ipcRenderer.send('xml-data-error');
+				}
+				
+				return;
+			}
+
 			// Handles mxfile
 			if (xmlDoc.documentElement.nodeName == 'mxfile')
 			{
@@ -179,6 +211,7 @@
 						doneDiv.setAttribute('bounds', JSON.stringify(bounds));
 						doneDiv.setAttribute('page-id', pageId);
 						doneDiv.setAttribute('scale', expScale);
+						doneDiv.setAttribute('pageCount', diagrams != null? diagrams.length : 1);
 						document.body.appendChild(doneDiv);
 
 						//Electron pdf export
@@ -187,8 +220,8 @@
 							try 
 							{
 								const { ipcRenderer } = require('electron');
-								
-								ipcRenderer.send('render-finished', bounds);
+								//For some reason, Electron 9 doesn't send this object as is without stringifying. Usually when variable is external to function own scope
+								ipcRenderer.send('render-finished', {bounds: JSON.stringify(bounds)});
 							}
 							catch(e)
 							{
@@ -235,52 +268,6 @@
 				{
 					window.MathJax.Hub.Queue(function ()
 					{
-						// Wraps all text labels in SVG foreignObjects to avoid
-						// Chrome changing offset for textboxes near page border
-						// FIXME: Transforms ignored
-// 						var pages = document.querySelectorAll('[id^=mxPage]');
-						
-// 						for (var i = 0; i < pages.length; i++)
-// 						{
-// 							var page = pages[i];
-// 							var svg = page.getElementsByTagName('svg')[0];
-// 							var divs = page.getElementsByTagName('div');
-// 							var snap = [];
-							
-// 							for (var j = 0; j < divs.length; j++)
-// 							{
-// 								if (divs[j].parentNode == svg.parentNode)
-// 								{
-// 									snap.push(divs[j]);
-// 								}
-// 							}
-							
-// 							var top = svg.parentNode.getBoundingClientRect();
-							
-// 							for (var j = 0; j < snap.length; j++)
-// 							{
-// 								if (snap[j].parentNode == svg.parentNode)
-// 								{
-// 									var fo = svg.ownerDocument.createElementNS(mxConstants.NS_SVG, 'foreignObject');
-// 									var rect = snap[j].getBoundingClientRect();
-									
-// 									// Sets position on foreignObject
-// 									fo.setAttribute('x', rect.x);
-// 									fo.setAttribute('y', rect.y - top.y);
-// 									fo.setAttribute('width', rect.width);
-// 									fo.setAttribute('height', rect.height);
-									
-// 									// Resets position on inner DIV
-//  									snap[j].style.top = '0px';
-// 									snap[j].style.left = '0px';
-// 									snap[j].style.transform = '';
-									
-// 									fo.appendChild(snap[j]);
-// 									svg.appendChild(fo);
-// 								}
-// 							}
-// 						}
-						
 						decrementWaitCounter();
 					});
 				}, 0);
@@ -393,11 +380,6 @@
 				// Enables math typesetting
 				math |= xmlDoc.documentElement.getAttribute('math') == '1';
 				
-				if (math)
-				{
-					mxClient.NO_FO = true;
-				}
-	
 				//Load external fonts
 				var extFonts = xmlDoc.documentElement.getAttribute('extFonts');
 				
@@ -424,24 +406,45 @@
 				var model = graph.getModel();
 				codec.decode(xmlDoc.documentElement, model);
 	
-				// Loads background color
-				var bg = (data.bg != null && data.bg.length > 0 && data.format != 'pdf') ?
-					data.bg : xmlDoc.documentElement.getAttribute('background');
-	
-				// Normalizes values for transparent backgrounds
-				if (bg == 'none' || bg == '')
+				var bg;
+				
+				if (data.format == 'pdf')
 				{
-					bg = null;
+					if (data.bg == 'none')
+					{
+						bg = null;	
+					}
+					else
+					{
+						bg = xmlDoc.documentElement.getAttribute('background');
+						
+						if (bg == 'none' || !bg)
+						{
+							bg = '#ffffff';
+						}
+					}
+				}
+				else
+				{
+					// Loads background color
+					bg = (data.bg != null && data.bg.length > 0) ?
+						data.bg : xmlDoc.documentElement.getAttribute('background');
+		
+					// Normalizes values for transparent backgrounds
+					if (bg == 'none' || bg == '')
+					{
+						bg = null;
+					}
+					
+					// Checks if export format supports transparent backgrounds
+					if (bg == null && data.format != 'gif' && data.format != 'png')
+					{
+						bg = '#ffffff';
+					}	
 				}
 				
-				// Checks if export format supports transparent backgrounds
-				if (bg == null && data.format != 'gif' && data.format != 'png')
-				{
-					bg = '#ffffff';
-				}
-	
 				// Sets background color on page
-				if (bg != null && (data.format != 'pdf' || xmlDoc.documentElement.getAttribute('page') != '1'))
+				if (bg != null)
 				{
 					document.body.style.backgroundColor = bg;
 				}
@@ -737,28 +740,26 @@
 						to = isNaN(to)? from : Math.max(from, Math.min(to, diagrams.length - 1));
 					}
 				}
-				else
+				
+				/**
+				 * Implements %page% and %pagenumber% placeholders
+				 */
+				var graphGetGlobalVariable = graph.getGlobalVariable;
+				
+				graph.getGlobalVariable = function(name)
 				{
-					/**
-					 * Implements %page% and %pagenumber% placeholders
-					 */
-					var graphGetGlobalVariable = graph.getGlobalVariable;
-					
-					graph.getGlobalVariable = function(name)
+					if (name == 'page')
 					{
-						if (name == 'page')
-						{
-							return (diagrams == null) ? 'Page-1' :
-								(diagrams[from].getAttribute('name') || ('Page-' + (from + 1)));
-						}
-						else if (name == 'pagenumber')
-						{
-							return from + 1;
-						}
-						
-						return graphGetGlobalVariable.apply(this, arguments);
-					};
-				}
+						return (diagrams == null) ? 'Page-1' :
+							(diagrams[from].getAttribute('name') || ('Page-' + (from + 1)));
+					}
+					else if (name == 'pagenumber')
+					{
+						return from + 1;
+					}
+					
+					return graphGetGlobalVariable.apply(this, arguments);
+				};
 					
 				for (var i = from; i <= to; i++) 
 				{
@@ -847,6 +848,5 @@
 	</script>
 </head>
 <body style="margin:0px;">
-	<div id="graph" style="width:100%;height:100%;"></div>
 </body>
 </html>

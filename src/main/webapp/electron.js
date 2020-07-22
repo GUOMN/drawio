@@ -7,7 +7,6 @@ const ipcMain = electron.ipcMain
 const dialog = electron.dialog
 const app = electron.app
 const BrowserWindow = electron.BrowserWindow
-const globalShortcut = electron.globalShortcut;
 const crc = require('crc');
 const zlib = require('zlib');
 const log = require('electron-log')
@@ -16,8 +15,9 @@ const {autoUpdater} = require("electron-updater")
 const Store = require('electron-store');
 const store = new Store();
 const ProgressBar = require('electron-progressbar');
-const { systemPreferences } = require('electron')
-const disableUpdate = require('./disableUpdate').disableUpdate();
+const disableUpdate = require('./disableUpdate').disableUpdate() || 
+						process.env.DRAWIO_DISABLE_UPDATE === 'true' || 
+						fs.existsSync('/.flatpak-info'); //This file indicates running in flatpak sandbox
 autoUpdater.logger = log
 autoUpdater.logger.transports.file.level = 'info'
 autoUpdater.autoDownload = false
@@ -39,7 +39,9 @@ function createWindow (opt = {})
 		'web-security': true,
 		webPreferences: {
 			// preload: path.resolve('./preload.js'),
-			nodeIntegration: true
+			nodeIntegration: true,
+			enableRemoteModule: true,
+			nodeIntegrationInWorker: true
 		}
 	}, opt)
 
@@ -58,17 +60,16 @@ function createWindow (opt = {})
 		query:
 		{
 			'dev': __DEV__ ? 1 : 0,
-			'drawdev': __DEV__ ? 1 : 0,
 			'test': __DEV__ ? 1 : 0,
-			'db': 0,
 			'gapi': 0,
+			'db': 0,
 			'od': 0,
 			'gh': 0,
+			'gl': 0,
 			'tr': 0,
-			'analytics': 0,
+			'browser': 0,
 			'picker': 0,
 			'mode': 'device',
-			'browser': 0,
 			'export': 'https://exp.draw.io/ImageExport4/export'
 		},
 		slashes: true
@@ -187,7 +188,7 @@ app.on('ready', e =>
         argv.unshift(null)
     }
 
-	var validFormatRegExp = /^(pdf|svg|png|jpeg|jpg|vsdx)$/;
+	var validFormatRegExp = /^(pdf|svg|png|jpeg|jpg|vsdx|xml)$/;
 	
 	function argsRange(val) 
 	{
@@ -206,7 +207,7 @@ app.on('ready', e =>
 	        .option('-r, --recursive', 'for a folder input, recursively convert all files in sub-folders also')
 	        .option('-o, --output <output file/folder>', 'specify the output file/folder. If omitted, the input file name is used for output with the specified format as extension')
 	        .option('-f, --format <format>',
-			    'if output file name extension is specified, this option is ignored (file type is determined from output extension, possible export formats are pdf, png, jpg, svg, vsdx)',
+			    'if output file name extension is specified, this option is ignored (file type is determined from output extension, possible export formats are pdf, png, jpg, svg, vsdx, and xml)',
 			    validFormatRegExp, 'pdf')
 			.option('-q, --quality <quality>',
 				'output image quality for JPEG (default: 90)', parseInt)
@@ -230,6 +231,8 @@ app.on('ready', e =>
 				'selects a specific page, if not specified and the format is an image, the first page is selected', parseInt)
 			.option('-g, --page-range <from>..<to>',
 				'selects a page range (for PDF format only)', argsRange)
+			.option('-u, --uncompressed',
+				'Uncompressed XML output (for XML format only)')
 	        .parse(argv)
 	}
 	catch(e)
@@ -242,7 +245,10 @@ app.on('ready', e =>
     if (program.export)
 	{
     	var dummyWin = new BrowserWindow({
-			show : false
+			show : false,
+			webPreferences: {
+				nodeIntegration: true
+			}
 		});
     	
     	windowsRegistry.push(dummyWin);
@@ -298,7 +304,7 @@ app.on('ready', e =>
 	    		from = program.pageRage[0] >= 0 ? program.pageRage[0] : null;
 	    		to = program.pageRage[1] >= 0 ? program.pageRage[1] : null;
 			}
-	    	
+
 			var expArgs = {
 				format: format,
 				w: program.width > 0 ? program.width : null,
@@ -310,7 +316,8 @@ app.on('ready', e =>
 				allPages: format == 'pdf' && program.allPages,
 				scale: (program.crop && program.scale == null) ? 1.00001: (program.scale || 1), //any value other than 1 crops the pdf
 				embedXml: program.embedDiagram? '1' : '0',
-				jpegQuality: program.quality
+				jpegQuality: program.quality,
+				uncompressed: program.uncompressed
 			};
 
 			var paths = program.args;
@@ -370,113 +377,138 @@ app.on('ready', e =>
 						{
 							var ext = path.extname(curFile);
 							
-							expArgs.xml = fs.readFileSync(curFile, ext === '.png'? null : 'utf-8');
+							expArgs.xml = fs.readFileSync(curFile, ext === '.png' || ext === '.vsdx' ? null : 'utf-8');
 							
 							if (ext === '.png')
 							{
-								expArgs.xml = new Buffer(expArgs.xml).toString('base64');
+								expArgs.xml = Buffer.from(expArgs.xml).toString('base64');
+								startExport();
+							}
+							else if (ext === '.vsdx')
+							{
+								dummyWin.loadURL(`file://${__dirname}/vsdxImporter.html`);
+								
+								const contents = dummyWin.webContents;
+
+								contents.on('did-finish-load', function()
+							    {
+									contents.send('import', expArgs.xml);
+
+									ipcMain.once('import-success', function(evt, xml)
+						    	    {
+										expArgs.xml = xml;
+										startExport();
+						    	    });
+						    	    
+						    	    ipcMain.once('import-error', function()
+						    	    {
+						    	    	console.error('Error: cannot import VSDX file: ' + curFile);
+						    	    	next();
+						    	    });
+							    });
+							}
+							else
+							{
+								startExport();
 							}
 							
-							var mockEvent = {
-								reply: function(msg, data)
+							function next()
+							{
+								fileIndex++;
+								
+								if (fileIndex < files.length)
 								{
-									try
+									processOneFile();
+								}
+								else
+								{
+									cmdQPressed = true;
+									dummyWin.destroy();
+								}
+							};
+							
+							function startExport()
+							{
+								var mockEvent = {
+									reply: function(msg, data)
 									{
-										if (data == null || data.length == 0)
+										try
 										{
-											console.error('Error: Export failed: ' + curFile);
-										}
-										else if (msg == 'export-success')
-										{
-											var outFileName = null;
-											
-											if (outType != null)
+											if (data == null || data.length == 0)
 											{
-												if (outType.isDir)
-												{
-													outFileName = path.join(program.output, path.basename(curFile)) + '.' + format;
-												}
-												else
-												{
-													outFileName = program.output;
-												}
+												console.error('Error: Export failed: ' + curFile);
 											}
-											else if (inStat.isFile())
+											else if (msg == 'export-success')
 											{
-												outFileName = path.join(path.dirname(paths[0]), path.basename(paths[0],
-													path.extname(paths[0]))) + '.' + format;
+												var outFileName = null;
 												
-											}
-											else //dir
-											{
-												outFileName = path.join(path.dirname(curFile), path.basename(curFile,
-													path.extname(curFile))) + '.' + format;
-											}
-											
-											try
-											{
-												var counter = 0;
-												var realFileName = outFileName;
-												
-												if (program.rawArgs.indexOf('-k') > -1 || program.rawArgs.indexOf('--check') > -1)
+												if (outType != null)
 												{
-													while (fs.existsSync(realFileName))
+													if (outType.isDir)
 													{
-														counter++;
-														realFileName = path.join(path.dirname(outFileName), path.basename(outFileName,
-															path.extname(outFileName))) + '-' + counter + path.extname(outFileName);
+														outFileName = path.join(program.output, path.basename(curFile)) + '.' + format;
+													}
+													else
+													{
+														outFileName = program.output;
 													}
 												}
+												else if (inStat.isFile())
+												{
+													outFileName = path.join(path.dirname(paths[0]), path.basename(paths[0],
+														path.extname(paths[0]))) + '.' + format;
+													
+												}
+												else //dir
+												{
+													outFileName = path.join(path.dirname(curFile), path.basename(curFile,
+														path.extname(curFile))) + '.' + format;
+												}
 												
-												fs.writeFileSync(realFileName, data, format == 'vsdx'? 'base64' : null, { flag: 'wx' });
-												console.log(curFile + ' -> ' + outFileName);
+												try
+												{
+													var counter = 0;
+													var realFileName = outFileName;
+													
+													if (program.rawArgs.indexOf('-k') > -1 || program.rawArgs.indexOf('--check') > -1)
+													{
+														while (fs.existsSync(realFileName))
+														{
+															counter++;
+															realFileName = path.join(path.dirname(outFileName), path.basename(outFileName,
+																path.extname(outFileName))) + '-' + counter + path.extname(outFileName);
+														}
+													}
+													
+													fs.writeFileSync(realFileName, data, format == 'vsdx'? 'base64' : null, { flag: 'wx' });
+													console.log(curFile + ' -> ' + outFileName);
+												}
+												catch(e)
+												{
+													console.error('Error writing to file: ' + outFileName);
+												}
 											}
-											catch(e)
+											else
 											{
-												console.error('Error writing to file: ' + outFileName);
+												console.error('Error: ' + data + ': ' + curFile);
 											}
+											
+											next();
 										}
-										else
+										finally
 										{
-											console.error('Error: ' + data + ': ' + curFile);
+											mockEvent.finalize();
 										}
-										
-										fileIndex++;
-										
-										if (fileIndex < files.length)
-										{
-											processOneFile();
-										}
-										else
-										{
-											cmdQPressed = true;
-											dummyWin.destroy();
-										}
-									}
-									finally
-									{
-										mockEvent.finalize();
-									}
-						    	}
+							    	}
+								};
+
+								exportDiagram(mockEvent, expArgs, true);
 							};
-					    	
-							exportDiagram(mockEvent, expArgs, true);
 						}
 						catch(e)
 						{
 							console.error('Error reading file: ' + curFile);
-							
-							fileIndex++;
-							
-							if (fileIndex < files.length)
-							{	
-								processOneFile();
-							}
-							else
-							{
-								cmdQPressed = true;
-								dummyWin.destroy();
-							}
+							next();
 						}
 					}
 					
@@ -502,11 +534,43 @@ app.on('ready', e =>
     	
     	return;
 	}
-    else if (program.rawArgs.indexOf('-h') > -1 || program.rawArgs.indexOf('--help') > -1) //To prevent execution when help arg is used
+    else if (program.rawArgs.indexOf('-h') > -1 || program.rawArgs.indexOf('--help') > -1 || program.rawArgs.indexOf('-V') > -1 || program.rawArgs.indexOf('--version') > -1) //To prevent execution when help/version arg is used
 	{
     	return;
 	}
     
+    //Prevent multiple instances of the application (casuses issues with configuration)
+    const gotTheLock = app.requestSingleInstanceLock()
+
+    if (!gotTheLock) 
+    {
+    	app.quit()
+    } 
+    else 
+    {
+    	app.on('second-instance', (event, commandLine, workingDirectory) => {
+    		//Create another window
+    		let win = createWindow()
+    	    
+    	    win.webContents.on('did-finish-load', function()
+    	    {
+    	    	ipcMain.once('app-load-finished', (evt, data) =>
+    			{
+	    	    	//Open the file if new app request is from opening a file
+	    	    	var potFile = commandLine.pop();
+	    	    	
+	    	    	if (fs.existsSync(potFile))
+	    	    	{
+	    	    		win.webContents.send('args-obj', {args: [potFile]});
+	    	    	}
+    			});
+    			
+    	        win.webContents.zoomFactor = 1;
+    	        win.webContents.setVisualZoomLevelLimits(1, 1);
+    	    });
+    	})
+    }
+
     let win = createWindow()
     
     win.webContents.on('did-finish-load', function()
@@ -525,11 +589,14 @@ app.on('ready', e =>
     	
     	firstWinLoaded = true;
     	
-        win.webContents.send('args-obj', program);
-        
-        win.webContents.setZoomFactor(1);
+    	ipcMain.once('app-load-finished', (evt, data) =>
+		{
+			//Sending entire program is not allowed in Electron 9 as it is not native JS object
+			win.webContents.send('args-obj', {args: program.args, create: program.create});
+		});
+    	
+        win.webContents.zoomFactor = 1;
         win.webContents.setVisualZoomLevelLimits(1, 1);
-        win.webContents.setLayoutZoomLevelLimits(0, 0);
     });
 	
     let updateNoAvailAdded = false;
@@ -557,7 +624,7 @@ app.on('ready', e =>
 	}
 
 	let template = [{
-	    label: app.getName(),
+	    label: app.name,
 	    submenu: [
 	      {
 	        label: 'Website',
@@ -589,10 +656,10 @@ app.on('ready', e =>
 	if (process.platform === 'darwin')
 	{
 	    template = [{
-	      label: app.getName(),
+	      label: app.name,
 	      submenu: [
 	        {
-	          label: 'About ' + app.getName(),
+	          label: 'About ' + app.name,
 	          click() { shell.openExternal('https://about.draw.io'); }
 	        },
 	        {
@@ -609,19 +676,16 @@ app.on('ready', e =>
 	      ]
 	    }, {
 	      label: 'Edit',
-	      submenu: [{
-	        label: 'Cut',
-	        accelerator: 'CmdOrCtrl+X',
-	        selector: 'cut:'
-	      }, {
-	        label: 'Copy',
-	        accelerator: 'CmdOrCtrl+C',
-	        selector: 'copy:'
-	      }, {
-	        label: 'Paste',
-	        accelerator: 'CmdOrCtrl+V',
-	        selector: 'paste:'
-	      }]
+	      submenu: [
+			{ role: 'undo' },
+			{ role: 'redo' },
+			{ type: 'separator' },
+			{ role: 'cut' },
+			{ role: 'copy' },
+			{ role: 'paste' },
+			{ role: 'pasteAndMatchStyle' },
+			{ role: 'selectAll' }
+	      ]
 	    }]
 	    
 	    if (disableUpdate)
@@ -689,18 +753,20 @@ app.on('will-finish-launching', function()
 	app.on("open-file", function(event, path) 
 	{
 	    event.preventDefault();
-	    
+
 	    if (firstWinLoaded)
 	    {
 		    let win = createWindow();
 		    
 		    win.webContents.on('did-finish-load', function()
 		    {
-		        win.webContents.send('args-obj', {args: [path]});
-		        
-		        win.webContents.setZoomFactor(1);
+		    	ipcMain.once('app-load-finished', (evt, data) =>
+		    	{
+		    		win.webContents.send('args-obj', {args: [path]});
+		    	});
+		    	
+		        win.webContents.zoomFactor = 1;
 		        win.webContents.setVisualZoomLevelLimits(1, 1);
-		        win.webContents.setLayoutZoomLevelLimits(0, 0);
 		    });
 	    }
 	    else
@@ -816,7 +882,7 @@ autoUpdater.on('update-available', (a, b) =>
 					type: 'question',
 					buttons: ['Install', 'Later'],
 					defaultId: 0,
-					message: 'A new version of ' + app.getName() + ' has been downloaded',
+					message: 'A new version of ' + app.name + ' has been downloaded',
 					detail: 'It will be installed the next time you restart the application',
 				}).then(result =>
 				{
@@ -981,44 +1047,47 @@ function exportVsdx(event, args, directFinalize)
 	let win = createWindow({
 		show : false
 	});
-    
+
     win.webContents.on('did-finish-load', function()
     {
-        win.webContents.send('export-vsdx', args);
-        
-        ipcMain.once('export-vsdx-finished', (evt, data) =>
+    	ipcMain.once('app-load-finished', (evt, data) =>
 		{
-			var hasError = false;
-			
-			if (data == null)
+	    	win.webContents.send('export-vsdx', args);
+	    	
+	        ipcMain.once('export-vsdx-finished', (evt, data) =>
 			{
-				hasError = true;
-			}
-			
-			//Set finalize here since it is call in the reply below
-			function finalize()
-			{
-				win.destroy();
-			};
-			
-			if (directFinalize === true)
-			{
-				event.finalize = finalize;
-			}
-			else
-			{
-				//Destroy the window after response being received by caller
-				ipcMain.once('export-finalize', finalize);
-			}
-			
-			if (hasError)
-			{
-				event.reply('export-error');
-			}
-			else
-			{
-				event.reply('export-success', data);
-			}
+				var hasError = false;
+				
+				if (data == null)
+				{
+					hasError = true;
+				}
+				
+				//Set finalize here since it is call in the reply below
+				function finalize()
+				{
+					win.destroy();
+				};
+				
+				if (directFinalize === true)
+				{
+					event.finalize = finalize;
+				}
+				else
+				{
+					//Destroy the window after response being received by caller
+					ipcMain.once('export-finalize', finalize);
+				}
+				
+				if (hasError)
+				{
+					event.reply('export-error');
+				}
+				else
+				{
+					event.reply('export-success', data);
+				}
+			});
 		});
     });
 };
@@ -1054,8 +1123,34 @@ function exportDiagram(event, args, directFinalize)
 
 		contents.on('did-finish-load', function()
 	    {
+			//Set finalize here since it is call in the reply below
+			function finalize()
+			{
+				browser.destroy();
+			};
+			
+			if (directFinalize === true)
+			{
+				event.finalize = finalize;
+			}
+			else
+			{
+				//Destroy the window after response being received by caller
+				ipcMain.once('export-finalize', finalize);
+			}
+
 			ipcMain.once('render-finished', (evt, bounds) =>
 			{
+				//For some reason, Electron 9 doesn't send this object as is without stringifying. Usually when variable is external to function own scope
+				try
+				{
+					bounds = JSON.parse(bounds.bounds);
+				}
+				catch(e)
+				{
+					bounds = null;
+				}
+				
 				var pdfOptions = {pageSize: 'A4'};
 				var hasError = false;
 				
@@ -1086,22 +1181,6 @@ function exportDiagram(event, args, directFinalize)
 				}
 				
 				var base64encoded = args.base64 == '1';
-				
-				//Set finalize here since it is call in the reply below
-				function finalize()
-				{
-					browser.destroy();
-				};
-				
-				if (directFinalize === true)
-				{
-					event.finalize = finalize;
-				}
-				else
-				{
-					//Destroy the window after response being received by caller
-					ipcMain.once('export-finalize', finalize);
-				}
 				
 				if (hasError)
 				{
@@ -1172,6 +1251,19 @@ function exportDiagram(event, args, directFinalize)
 				}
 			});
 
+			if (args.format == 'xml')
+			{
+				ipcMain.once('xml-data', (evt, data) =>
+				{
+					event.reply('export-success', data);
+				});
+				
+				ipcMain.once('xml-data-error', () =>
+				{
+					event.reply('export-error');
+				});
+			}
+			
 			contents.send('render', {
 				xml: args.xml,
 				format: args.format,
@@ -1184,7 +1276,8 @@ function exportDiagram(event, args, directFinalize)
 				pageId: args.pageId,
 				allPages: args.allPages,
 				scale: args.scale || 1,
-				extras: args.extras
+				extras: args.extras,
+				uncompressed: args.uncompressed
 			});
 	    });
 	}

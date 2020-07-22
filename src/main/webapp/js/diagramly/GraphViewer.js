@@ -16,12 +16,12 @@ mxUtils.extend(GraphViewer, mxEventSource);
 /**
  * Redirects editing to absolue URLs.
  */
-GraphViewer.prototype.editBlankUrl = 'https://www.draw.io/';
+GraphViewer.prototype.editBlankUrl = 'https://app.diagrams.net/';
 
 /**
  * Base URL for relative images.
  */
-GraphViewer.prototype.imageBaseUrl = 'https://www.draw.io/';
+GraphViewer.prototype.imageBaseUrl = 'https://app.diagrams.net/';
 
 /**
  * Redirects editing to absolue URLs.
@@ -320,15 +320,12 @@ GraphViewer.prototype.init = function(container, xmlNode, graphConfig)
 				
 				this.graph.customLinkClicked = function(href)
 				{
-					var done = true;
-					
 					if (href.substring(0, 13) == 'data:page/id,')
 					{
 						var comma = href.indexOf(',');
 						
 						if (!self.selectPageById(href.substring(comma + 1)))
 						{
-							done = false;
 							alert(mxResources.get('pageNotFound') || 'Page not found');
 						}
 					}
@@ -337,8 +334,17 @@ GraphViewer.prototype.init = function(container, xmlNode, graphConfig)
 						this.handleCustomLink(href);
 					}
 					
-					return done;
+					return true;
 				};
+				
+				//Fix graph clipping by avoiding negative negative translation (after resize is finished)
+				var graphFoldCells = this.graph.foldCells;
+				
+				this.graph.foldCells = mxUtils.bind(this, function()
+				{
+					this.cellFolded = true;
+					return graphFoldCells.apply(this.graph, arguments);
+				});
 				
 				this.fireEvent(new mxEventObject('render'));
 			});
@@ -412,6 +418,9 @@ GraphViewer.prototype.getImageUrl = function(url)
  */
 GraphViewer.prototype.setXmlNode = function(xmlNode)
 {
+	//Extract graph model from html & svg formats 
+	xmlNode = this.editor.extractGraphModel(xmlNode, true);
+
 	this.xmlDocument = xmlNode.ownerDocument;
 	this.xml = mxUtils.getXml(xmlNode);
 	this.xmlNode = xmlNode;
@@ -545,6 +554,25 @@ GraphViewer.prototype.addSizeHandler = function()
 					{
 						this.toolbar.style.top = r.top + 'px';
 					}
+				}
+			}
+			else if (this.toolbar != null)
+			{
+				this.toolbar.style.width = Math.max(this.minToolbarWidth, container.offsetWidth) + 'px';
+			}
+
+			//If a cell is folded set the translation zero to avoid -ve translation
+			if (this.cellFolded)
+			{
+				this.cellFolded = false;
+				
+				if (this.center)
+				{
+					this.graph.center();
+				}
+				else
+				{
+					this.graph.view.setTranslate(0, 0);
 				}
 			}
 			
@@ -1171,6 +1199,7 @@ GraphViewer.prototype.addToolbar = function()
 		mxUtils.setOpacity(filename, 70);
 		
 		toolbar.appendChild(filename);
+		this.filename = filename;
 	}
 	
 	this.minToolbarWidth = buttonCount * 34;
@@ -1294,7 +1323,12 @@ GraphViewer.prototype.addClickHandler = function(graph, ui)
 		
 		if (ui != null)
 		{
-			if (href != null && !(graph.isExternalProtocol(href) || graph.isBlankLink(href) || graph.customLinkClicked(href)))
+			if (href == null || graph.isCustomLink(href))
+			{
+				mxEvent.consume(evt);
+			}
+			else if (!graph.isExternalProtocol(href) &&
+					!graph.isBlankLink(href))
 			{
 				// Hides lightbox if any links are clicked
 				// Async handling needed for anchors to work
@@ -1303,15 +1337,13 @@ GraphViewer.prototype.addClickHandler = function(graph, ui)
 					ui.destroy();
 				}, 0);
 			}
-			else
-			{
-				mxEvent.consume(evt);
-			}
 		}
 		else if (href != null && ui == null && graph.isCustomLink(href) &&
 			(mxEvent.isTouchEvent(evt) || !mxEvent.isPopupTrigger(evt)) &&
 			graph.customLinkClicked(href))
 		{
+			// Workaround for text selection in Firefox on Windows
+			mxUtils.clearSelection();
 			mxEvent.consume(evt);
 		}
 	}), mxUtils.bind(this, function(evt)
@@ -1395,7 +1427,7 @@ GraphViewer.prototype.showLightbox = function(editable, closable, target)
 				param.data = encodeURIComponent(this.xml);
 			}
 			
-			var domain = 'www.draw.io';
+			var domain = 'app.diagrams.net';
 			
 			if (urlParams['dev'] == '1')
 			{
@@ -1467,10 +1499,11 @@ GraphViewer.prototype.showLocalLightbox = function()
 	urlParams['pages'] = '1';
 	urlParams['page'] = this.currentPage;
 	urlParams['page-id'] = this.graphConfig.pageId;
-	urlParams['layer-ids'] = this.graphConfig.layerIds != null? this.graphConfig.layerIds.join(' ') : null;
+	urlParams['layer-ids'] = (this.graphConfig.layerIds != null && this.graphConfig.layerIds.length > 0)
+														? this.graphConfig.layerIds.join(' ') : null;
 	urlParams['nav'] = (this.graphConfig.nav != false) ? '1' : '0';
 	urlParams['layers'] = (this.layersEnabled) ? '1' : '0';
-	
+
 	// PostMessage not working and Permission denied for opened access in IE9-
 	if (document.documentMode == null || document.documentMode >= 10)
 	{
@@ -1638,6 +1671,23 @@ GraphViewer.prototype.showLocalLightbox = function()
 	}), 0);
 
 	return ui;
+};
+
+GraphViewer.prototype.updateTitle = function(title)
+{
+	title = title || '';
+	
+	if (this.showTitleAsTooltip && this.graph != null && this.graph.container != null)
+	{
+		this.graph.container.setAttribute('title', title);
+    }
+	
+	if (this.filename != null)
+	{
+		this.filename.innerHTML = '';
+		mxUtils.write(this.filename, title);
+		this.filename.setAttribute('title', title);
+	}
 };
 
 /**
@@ -1837,7 +1887,8 @@ GraphViewer.getUrl = function(url, onload, onerror)
 	}
 	else
 	{
-		var xhr = (navigator.userAgent.indexOf('MSIE 9') > 0) ? new XDomainRequest() : new XMLHttpRequest();
+		var xhr = (navigator.userAgent != null && navigator.userAgent.indexOf('MSIE 9') > 0) ?
+			new XDomainRequest() : new XMLHttpRequest();
 		xhr.open('GET', url);
 		
 	    xhr.onload = function()
